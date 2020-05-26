@@ -10,7 +10,7 @@
 backend=pytorch
 stage=0        # start from 0 if you need to start from data preparation
 stop_stage=100
-ngpu=1         # number of gpus ("0" uses cpu, otherwise use gpu)
+ngpu=8         # number of gpus ("0" uses cpu, otherwise use gpu)
 debugmode=1
 dumpdir=dump   # directory to dump full features
 N=0            # number of minibatches to be used (mainly for debugging). "0" uses all minibatches.
@@ -36,11 +36,11 @@ n_average=10
 lang_model=rnnlm.model.best # set a language model to be used for decoding
 
 # data
-swbd1_dir=/export/corpora3/LDC/LDC97S62
-eval2000_dir="/export/corpora2/LDC/LDC2002S09/hub5e_00 /export/corpora2/LDC/LDC2002T43"
-rt03_dir=/export/corpora/LDC/LDC2007S10
+LDC_dir=/home/psridhar/LDC/unprocessed
+swbd1_dir="${LDC_dir}/LDC97S62"
+eval2000_dir="${LDC_dir}/LDC2002S09/hub5e_00 ${LDC_dir}/LDC2002T43"
 # path to the Fisher corpus LDC2004T19 LDC2005T19 LDC2004S13 LDC2005S13 for LM training (optional)
-fisher_dir="/export/corpora3/LDC/LDC2004T19 /export/corpora3/LDC/LDC2005T19 /export/corpora3/LDC/LDC2004S13 /export/corpora3/LDC/LDC2005S13"
+fisher_dir="${LDC_dir}/LDC2004T19 ${LDC_dir}/LDC2005T19 ${LDC_dir}/LDC2004S13 ${LDC_dir}/LDC2005S13"
 
 # bpemode (unigram or bpe)
 nbpe=2000
@@ -59,7 +59,7 @@ set -o pipefail
 
 train_set=train_nodup
 train_dev=train_dev
-recog_set="train_dev eval2000 rt03"
+recog_set="train_dev eval2000"
 
 if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     ### Task dependent. You have to make data the following preparation part by yourself.
@@ -69,12 +69,11 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     local/swbd1_prepare_dict.sh
     local/swbd1_data_prep.sh ${swbd1_dir}
     local/eval2000_data_prep.sh ${eval2000_dir}
-    local/rt03_data_prep.sh ${rt03_dir}
     if [ -n "${fisher_dir}" ]; then
         local/fisher_data_prep.sh ${fisher_dir}
     fi
     # upsample audio from 8k to 16k to make a recipe consistent with others
-    for x in train eval2000 rt03; do
+    for x in train eval2000; do
 	    sed -i.bak -e "s/$/ sox -R -t wav - -t wav - rate 16000 dither | /" data/${x}/wav.scp
     done
     # normalize eval2000 and rt03 texts by
@@ -82,7 +81,7 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     # 2) remove tags (%AH) (%HESITATION) (%UH)
     # 3) remove <B_ASIDE> <E_ASIDE>
     # 4) remove "(" or ")"
-    for x in eval2000 rt03; do
+    for x in eval2000; do
         cp data/${x}/text data/${x}/text.org
         paste -d "" \
             <(cut -f 1 -d" " data/${x}/text.org) \
@@ -101,8 +100,8 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     echo "stage 1: Feature Generation"
     fbankdir=fbank
     # Generate the fbank features; by default 80-dimensional fbanks with pitch on each frame
-    for x in train eval2000 rt03; do
-        steps/make_fbank_pitch.sh --cmd "$train_cmd" --nj 32 --write_utt2num_frames true \
+    for x in train eval2000; do
+        steps/make_fbank_pitch.sh --cmd "$train_cmd" --nj 64 --write_utt2num_frames true \
             data/${x} exp/make_fbank/${x} ${fbankdir}
         utils/fix_data_dir.sh data/${x}
     done
@@ -126,7 +125,7 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
         /export/b{10,11,12,13}/${USER}/espnet-data/egs/swbd/asr1/dump/${train_dev}/delta${do_delta}/storage \
         ${feat_dt_dir}/storage
     fi
-    dump.sh --cmd "$train_cmd" --nj 32 --do_delta ${do_delta} \
+    dump.sh --cmd "$train_cmd" --nj 64 --do_delta ${do_delta} \
         data/${train_set}/feats.scp data/${train_set}/cmvn.ark exp/dump_feats/train ${feat_tr_dir}
     dump.sh --cmd "$train_cmd" --nj 10 --do_delta ${do_delta} \
         data/${train_dev}/feats.scp data/${train_set}/cmvn.ark exp/dump_feats/dev ${feat_dt_dir}
@@ -261,7 +260,9 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
         --verbose ${verbose} \
         --resume ${resume} \
         --train-json ${feat_tr_dir}/data_${bpemode}${nbpe}.json \
-        --valid-json ${feat_dt_dir}/data_${bpemode}${nbpe}.json
+        --valid-json ${feat_dt_dir}/data_${bpemode}${nbpe}.json \
+	--report-cer \
+	--report-wer
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
