@@ -10,7 +10,7 @@
 backend=pytorch
 stage=0        # start from 0 if you need to start from data preparation
 stop_stage=100
-ngpu=1         # number of gpus ("0" uses cpu, otherwise use gpu)
+ngpu=8         # number of gpus ("0" uses cpu, otherwise use gpu)
 debugmode=1
 dumpdir=dump   # directory to dump full features
 N=0            # number of minibatches to be used (mainly for debugging). "0" uses all minibatches.
@@ -36,18 +36,18 @@ n_average=10
 lang_model=rnnlm.model.best # set a language model to be used for decoding
 
 # data
-swbd1_dir=/export/corpora3/LDC/LDC97S62
-eval2000_dir="/export/corpora2/LDC/LDC2002S09/hub5e_00 /export/corpora2/LDC/LDC2002T43"
-rt03_dir=/export/corpora/LDC/LDC2007S10
-# path to the Fisher corpus LDC2004T19 LDC2005T19 LDC2004S13 LDC2005S13 for LM training (optional)
-fisher_dir="/export/corpora3/LDC/LDC2004T19 /export/corpora3/LDC/LDC2005T19 /export/corpora3/LDC/LDC2004S13 /export/corpora3/LDC/LDC2005S13"
+LDC_dir=/home/psridhar/LDC/unprocessed
+swbd1_dir="${LDC_dir}/LDC97S62"
+eval2000_dir="${LDC_dir}/LDC2002S09/hub5e_00 ${LDC_dir}/LDC2002T43"
+fisher_dir="${LDC_dir}/LDC2004T19 ${LDC_dir}/LDC2005T19 ${LDC_dir}/LDC2004S13 ${LDC_dir}/LDC2005S13"
+#fisher_dir=
 
 # bpemode (unigram or bpe)
 nbpe=2000
 bpemode=bpe
 
 # exp tag
-tag="" # tag for managing experiments.
+tag="fisher" # tag for managing experiments.
 
 . utils/parse_options.sh || exit 1;
 
@@ -59,7 +59,7 @@ set -o pipefail
 
 train_set=train_nodup
 train_dev=train_dev
-recog_set="train_dev eval2000 rt03"
+recog_set="train_dev eval2000"
 
 if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     ### Task dependent. You have to make data the following preparation part by yourself.
@@ -69,20 +69,21 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     local/swbd1_prepare_dict.sh
     local/swbd1_data_prep.sh ${swbd1_dir}
     local/eval2000_data_prep.sh ${eval2000_dir}
-    local/rt03_data_prep.sh ${rt03_dir}
     if [ -n "${fisher_dir}" ]; then
-        local/fisher_data_prep.sh ${fisher_dir}
+	local/fisher_data_prep.sh ${fisher_dir}
     fi
+    utils/combine_data.sh data/train_all data/train_fisher data/train
+
     # upsample audio from 8k to 16k to make a recipe consistent with others
-    for x in train eval2000 rt03; do
-	    sed -i.bak -e "s/$/ sox -R -t wav - -t wav - rate 16000 dither | /" data/${x}/wav.scp
+    for x in train_all eval2000; do
+	    sed -i.bak -e "s/$/ sox -R -t wav - -t wav - rate 8000 dither | /" data/${x}/wav.scp
     done
     # normalize eval2000 and rt03 texts by
     # 1) convert upper to lower
     # 2) remove tags (%AH) (%HESITATION) (%UH)
     # 3) remove <B_ASIDE> <E_ASIDE>
     # 4) remove "(" or ")"
-    for x in eval2000 rt03; do
+    for x in eval2000; do
         cp data/${x}/text data/${x}/text.org
         paste -d "" \
             <(cut -f 1 -d" " data/${x}/text.org) \
@@ -99,43 +100,24 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     ### Task dependent. You have to design training and dev sets by yourself.
     ### But you can utilize Kaldi recipes in most cases
     echo "stage 1: Feature Generation"
+    remove_longshortdata.sh --maxframes 3000 --maxchars 400 --minchars 1 data/train_all data/${train_set}
+    remove_longshortdata.sh --maxframes 3000 --maxchars 400 --minchars 1 data/eval2000 data/${train_dev}
     fbankdir=fbank
     # Generate the fbank features; by default 80-dimensional fbanks with pitch on each frame
-    for x in train eval2000 rt03; do
-        steps/make_fbank_pitch.sh --cmd "$train_cmd" --nj 32 --write_utt2num_frames true \
-            data/${x} exp/make_fbank/${x} ${fbankdir}
+    for x in ${train_set} ${train_dev}; do
+        steps/make_fbank_pitch.sh --cmd "$train_cmd" --nj 64 --write_utt2num_frames true data/${x} exp/make_fbank/${x} ${fbankdir}
         utils/fix_data_dir.sh data/${x}
     done
 
-    utils/subset_data_dir.sh --first data/train 4000 data/${train_dev} # 5hr 6min
-    n=$(($(wc -l < data/train/segments) - 4000))
-    utils/subset_data_dir.sh --last data/train ${n} data/train_nodev
-    utils/data/remove_dup_utts.sh 300 data/train_nodev data/${train_set} # 286hr
 
     # compute global CMVN
     compute-cmvn-stats scp:data/${train_set}/feats.scp data/${train_set}/cmvn.ark
 
     # dump features for training
-    if [[ $(hostname -f) == *.clsp.jhu.edu ]] && [ ! -d ${feat_tr_dir}/storage ]; then
-    utils/create_split_dir.pl \
-        /export/b{10,11,12,13}/${USER}/espnet-data/egs/swbd/asr1/dump/${train_set}/delta${do_delta}/storage \
-        ${feat_tr_dir}/storage
-    fi
-    if [[ $(hostname -f) == *.clsp.jhu.edu ]] && [ ! -d ${feat_dt_dir}/storage ]; then
-    utils/create_split_dir.pl \
-        /export/b{10,11,12,13}/${USER}/espnet-data/egs/swbd/asr1/dump/${train_dev}/delta${do_delta}/storage \
-        ${feat_dt_dir}/storage
-    fi
-    dump.sh --cmd "$train_cmd" --nj 32 --do_delta ${do_delta} \
+    dump.sh --cmd "$train_cmd" --nj 64 --do_delta ${do_delta} \
         data/${train_set}/feats.scp data/${train_set}/cmvn.ark exp/dump_feats/train ${feat_tr_dir}
-    dump.sh --cmd "$train_cmd" --nj 10 --do_delta ${do_delta} \
+    dump.sh --cmd "$train_cmd" --nj 64 --do_delta ${do_delta} \
         data/${train_dev}/feats.scp data/${train_set}/cmvn.ark exp/dump_feats/dev ${feat_dt_dir}
-    for rtask in ${recog_set}; do
-        feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}; mkdir -p ${feat_recog_dir}
-        dump.sh --cmd "$train_cmd" --nj 10 --do_delta ${do_delta} \
-            data/${rtask}/feats.scp data/${train_set}/cmvn.ark exp/dump_feats/recog/${rtask} \
-            ${feat_recog_dir}
-    done
 fi
 
 dict=data/lang_char/${train_set}_${bpemode}${nbpe}_units.txt
@@ -149,14 +131,8 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
     echo "<unk> 1" > ${dict} # <unk> must be 1, 0 will be used for "blank" in CTC
 
     # map acronym such as p._h._d. to p h d for train_set& dev_set
-    cp data/${train_set}/text data/${train_set}/text.backup
-    cp data/${train_dev}/text data/${train_dev}/text.backup
     sed -i 's/\._/ /g; s/\.//g; s/them_1/them/g' data/${train_set}/text
     sed -i 's/\._/ /g; s/\.//g; s/them_1/them/g' data/${train_dev}/text
-    if [ -n "${fisher_dir}" ]; then
-        cp data/train_fisher/text data/train_fisher/text.backup
-        sed -i 's/\._/ /g; s/\.//g; s/them_1/them/g' data/train_fisher/text
-    fi
 
     echo "make a dictionary"
     cut -f 2- -d" " data/${train_set}/text > data/lang_char/input.txt
@@ -175,19 +151,12 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
             --user_defined_symbols="[laughter],[noise],[vocalized-noise]"
 
     spm_encode --model=${bpemodel}.model --output_format=piece < data/lang_char/input.txt | tr ' ' '\n' | sort | uniq | awk '{print $0 " " NR+1}' >> ${dict}
-    wc -l ${dict}
 
     echo "make json files"
     data2json.sh --feat ${feat_tr_dir}/feats.scp --bpecode ${bpemodel}.model \
         data/${train_set} ${dict} > ${feat_tr_dir}/data_${bpemode}${nbpe}.json
     data2json.sh --feat ${feat_dt_dir}/feats.scp --bpecode ${bpemodel}.model \
         data/${train_dev} ${dict} > ${feat_dt_dir}/data_${bpemode}${nbpe}.json
-
-    for rtask in ${recog_set}; do
-        feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}
-        data2json.sh --feat ${feat_recog_dir}/feats.scp --allow-one-column true \
-            --bpecode ${bpemodel}.model data/${rtask} ${dict} > ${feat_recog_dir}/data_${bpemode}${nbpe}.json
-    done
 fi
 
 # You can skip this and remove --rnnlm option in the recognition (stage 5)
@@ -202,17 +171,10 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     echo "stage 3: LM Preparation"
     lmdatadir=data/local/lm_train_${bpemode}${nbpe}
     mkdir -p data/local/lm_train ${lmdatadir}
-    cut -f 2- -d" " data/${train_set}/text | gzip -c > data/local/lm_train/${train_set}_text.gz
-    if [ -n "${fisher_dir}" ]; then
-        cut -f 2- -d" " data/train_fisher/text | gzip -c > data/local/lm_train/train_fisher_text.gz
-        # combine swbd and fisher texts
-        zcat data/local/lm_train/${train_set}_text.gz data/local/lm_train/train_fisher_text.gz |\
-            spm_encode --model=${bpemodel}.model --output_format=piece > ${lmdatadir}/train.txt
-    else
-        zcat data/local/lm_train/${train_set}_text.gz |\
-            spm_encode --model=${bpemodel}.model --output_format=piece > ${lmdatadir}/train.txt
-    fi
-    cut -f 2- -d" " data/${train_dev}/text | \
+    cut -f 2- -d" " data/train/text | gzip -c > data/local/lm_train/${train_set}_text.gz
+    zcat data/local/lm_train/${train_set}_text.gz |\
+        spm_encode --model=${bpemodel}.model --output_format=piece > ${lmdatadir}/train.txt
+    cut -f 2- -d" " data/eval2000/text | \
         spm_encode --model=${bpemodel}.model --output_format=piece > ${lmdatadir}/valid.txt
 
     ${cuda_cmd} --gpu ${ngpu} ${lmexpdir}/train.log \
@@ -261,7 +223,10 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
         --verbose ${verbose} \
         --resume ${resume} \
         --train-json ${feat_tr_dir}/data_${bpemode}${nbpe}.json \
-        --valid-json ${feat_dt_dir}/data_${bpemode}${nbpe}.json
+        --valid-json ${feat_dt_dir}/data_${bpemode}${nbpe}.json \
+	--report-cer \
+	--report-wer \
+	--report-interval-iters 50
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
